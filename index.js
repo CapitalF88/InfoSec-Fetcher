@@ -1,40 +1,69 @@
 const express = require('express');
-const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
 
+// Vercel serverless function handler
 module.exports = async (req, res) => {
+  // Set CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/rss+xml; charset=utf-8');
 
+  let browser;
+  
   try {
-    console.log('Fetching NCA news...');
+    console.log('Starting to scrape NCA news...');
     
-    const response = await fetch('https://nca.gov.sa/en/news', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+    // Launch browser with Vercel-optimized settings
+    browser = await puppeteer.launch({ 
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--single-process'
+      ]
     });
     
-    const html = await response.text();
-    const $ = cheerio.load(html);
+    const page = await browser.newPage();
     
-    const items = [];
-    $('.card-body').each((index, element) => {
-      if (index >= 5) return false; // Limit to 5 items
-      
-      const title = $(element).find('h3').text().trim();
-      const link = $(element).find('a').attr('href');
-      const desc = $(element).find('p').text().trim();
-      
-      if (title && link) {
-        items.push({
-          title,
-          link: link.startsWith('http') ? link : `https://nca.gov.sa${link}`,
-          desc: desc || 'No description available',
-          pubDate: new Date().toUTCString()
-        });
-      }
+    // Set user agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    
+    // Navigate with shorter timeout for Vercel
+    await page.goto('https://nca.gov.sa/en/news', { 
+      waitUntil: 'domcontentloaded',
+      timeout: 15000 
     });
 
+    // Wait for content
+    await page.waitForSelector('.card-body', { timeout: 5000 });
+
+    const items = await page.evaluate(() => {
+      const nodes = Array.from(document.querySelectorAll('.card-body'));
+      return nodes.slice(0, 5).map((node, index) => { // Limit to 5 items
+        const title = node.querySelector('h3')?.innerText?.trim();
+        const linkElement = node.querySelector('a');
+        const link = linkElement?.href;
+        const desc = node.querySelector('p')?.innerText?.trim();
+        
+        if (title && link) {
+          return { 
+            title, 
+            link: link.startsWith('http') ? link : `https://nca.gov.sa${link}`,
+            desc: desc || 'No description available',
+            pubDate: new Date().toUTCString()
+          };
+        }
+        return null;
+      }).filter(item => item !== null);
+    });
+
+    console.log(`Found ${items.length} news items`);
+
+    // Generate RSS items
     const rssItems = items.map(item => `
     <item>
       <title><![CDATA[${item.title}]]></title>
@@ -58,7 +87,14 @@ module.exports = async (req, res) => {
     res.send(rssFeed);
     
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Failed to generate RSS feed' });
+    console.error('Error generating RSS feed:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate RSS feed', 
+      message: error.message 
+    });
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 };
